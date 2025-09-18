@@ -1,0 +1,336 @@
+app.py
+import streamlit as st
+import joblib
+import pandas as pd
+import re
+from urllib.parse import urlparse
+from scipy.sparse import hstack
+import tldextract
+
+# =====================================================================
+# 1. Feature Extraction Logic
+# =====================================================================
+
+# Pre-compiled regex for efficiency
+IP_RE = re.compile(r'^\d{1,3}(?:\.\d{1,3}){3}$')
+KEYWORDS = ['login', 'secure', 'account', 'verify', 'update', 'signin', 'bank', 'paypal', 'confirm', 'password']
+
+def normalize_url(url: str) -> str:
+    """Ensure URL has a scheme for proper parsing."""
+    url = url.strip()
+    if '://' not in url:
+        url = 'http://' + url
+    return url
+
+def extract_lexical(url: str) -> dict:
+    """Extracts lexical features from a URL."""
+    features = {}
+    url = normalize_url(url)
+    parsed = urlparse(url)
+    hostname = parsed.hostname or ''
+    path = parsed.path or ''
+
+    # Basic length features
+    features['url_length'] = len(url)
+    features['hostname_length'] = len(hostname)
+    features['path_length'] = len(path)
+
+    # Counting features
+    features['special_char_count'] = url.count('.') + url.count('/') + url.count('-') + url.count('=') + url.count('?') + url.count('&')
+    features['subdomain_count'] = hostname.count('.')
+    features['path_depth'] = path.count('/')
+
+    # Boolean/Binary features
+    features['contains_ip'] = 1 if IP_RE.match(hostname) else 0
+    features['contains_https'] = 1 if parsed.scheme == 'https' else 0
+
+    # Keyword features
+    low_url = url.lower()
+    for k in KEYWORDS:
+        features[f'kw_{k}'] = 1 if k in low_url else 0
+
+    return features
+
+# =====================================================================
+# 2. Model and Artifact Loading
+# =====================================================================
+
+@st.cache_resource
+def load_artifacts():
+    """Loads the pre-trained model and preprocessing artifacts."""
+    try:
+        model = joblib.load('models/model.joblib')
+        tfidf = joblib.load('models/tfidf.joblib')
+        scaler = joblib.load('models/scaler.joblib')
+        lex_cols = joblib.load('models/lex_cols.joblib')
+        return model, tfidf, scaler, lex_cols
+    except FileNotFoundError:
+        return None, None, None, None
+
+# Load the artifacts at the start
+model, tfidf, scaler, lex_cols = load_artifacts()
+
+# =====================================================================
+# 3. Core Logic Functions
+# =====================================================================
+
+def perform_prediction(url):
+    """Takes a URL and returns the prediction, probability, and features."""
+    lexical_features = extract_lexical(url)
+    lex_df = pd.DataFrame([lexical_features])[lex_cols]
+    
+    X_lex_scaled = scaler.transform(lex_df)
+    X_tfidf = tfidf.transform([url])
+    
+    X = hstack([X_tfidf, X_lex_scaled])
+    
+    prediction_proba = model.predict_proba(X)[0, 1]
+    prediction = 1 if prediction_proba >= 0.5 else 0
+    
+    return prediction, prediction_proba, lexical_features
+
+def display_explanation(prediction, lexical_features):
+    """Displays the reasons for the model's prediction."""
+    reasons = []
+    if lexical_features['contains_ip']:
+        reasons.append("URL contains an IP address, which is highly suspicious.")
+    if lexical_features['subdomain_count'] > 2:
+        reasons.append(f"URL has multiple subdomains ({lexical_features['subdomain_count']}), often used to obscure the true domain.")
+    if not lexical_features['contains_https']:
+        reasons.append("URL does not use HTTPS, which is a red flag for sites handling sensitive information.")
+    if lexical_features['url_length'] > 75:
+        reasons.append(f"URL is unusually long ({lexical_features['url_length']} characters).")
+    
+    detected_keywords = [k.replace('kw_', '') for k, v in lexical_features.items() if k.startswith('kw_') and v == 1]
+    if detected_keywords:
+        reasons.append(f"URL contains suspicious keywords: **{', '.join(detected_keywords)}**.")
+
+    if prediction == 1:  # If predicted as Phishing
+        if reasons:
+            for reason in reasons:
+                st.error(f"🚩 {reason}")
+        else:
+            st.warning("⚠️ This URL was flagged as phishing due to complex patterns learned by the model, even though it doesn't contain common red-flag keywords.")
+    else:  # If predicted as Legitimate
+        st.success("✅ This URL does not exhibit common red flags and its structure aligns with patterns of legitimate websites.")
+
+# =====================================================================
+# 4. Streamlit User Interface
+# =====================================================================
+
+st.set_page_config(page_title="Phishing URL Detector", page_icon="🎣", layout="wide")
+
+st.title("🎣 Real-time Phishing URL Detector")
+st.markdown("Enter a URL to check if it's a potential phishing site. The detector uses a machine learning model trained on its lexical features.")
+
+# --- Main Application Logic ---
+if not all([model, tfidf, scaler, lex_cols]):
+    st.error("🚨 Model artifacts not found! Please ensure the `models/` directory is present and contains the required `.joblib` files. You may need to run the training script first.")
+else:
+    url_input = st.text_input("Enter URL here:", placeholder="e.g., https://www.google.com or http://secure-login-update.com/account")
+
+    if st.button("Check URL"):
+        if not url_input:
+            st.warning("Please enter a URL to check.")
+        else:
+            # Perform prediction and get results
+            prediction, prediction_proba, lexical_features = perform_prediction(url_input)
+            
+            # Display prediction and confidence
+            st.subheader("Results")
+            col1, col2 = st.columns(2)
+            with col1:
+                if prediction == 1:
+                    st.metric(label="Prediction", value="Phishing", delta="High Risk", delta_color="inverse")
+                else:
+                    st.metric(label="Prediction", value="Legitimate", delta="Low Risk", delta_color="normal")
+            with col2:
+                st.metric(label="Confidence Score", value=f"{prediction_proba:.2%}")
+
+            # Display the explanation for the result
+            with st.expander("Why this prediction?", expanded=True):
+                st.markdown("The model's decision is based on the following URL features:")
+                display_explanation(prediction, lexical_features)
+
+# --- "How it Works" Section ---
+st.markdown("---")
+with st.expander("⚙️ How It Works"):
+    st.markdown("""
+    This tool analyzes URLs based on their structure and content without actually visiting the websites. It uses several **lexical features**:
+    
+    * **Length Features:** URL length, hostname length, etc.
+    * **Character Counts:** Number of special characters like `/`, `.`, `-`.
+    * **Keyword Analysis:** Presence of suspicious words like 'login', 'secure', 'bank'.
+    * **Structural Properties:** Use of an IP address instead of a domain name, number of subdomains, and use of HTTPS.
+    
+    A **LightGBM machine learning model** was trained on thousands of legitimate and phishing URLs to learn these patterns. The **confidence score** represents the model's calculated probability that the URL is a phishing link.
+    """)
+
+
+
+train_model.py
+# train_model.py
+
+import pandas as pd
+import re
+import os
+from urllib.parse import urlparse
+import joblib
+from sklearn.model_selection import train_test_split
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.preprocessing import StandardScaler
+from scipy.sparse import hstack
+import lightgbm as lgb
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
+
+print("Starting model training script...")
+
+# =====================================================================
+# 1. Data Loading and Preprocessing
+# =====================================================================
+
+print("Step 1: Loading and preprocessing data...")
+
+# Load datasets
+try:
+    # Use only the 'url' column from phishtank
+    phish_df = pd.read_csv('data/phishing_urls.csv', usecols=['url'])
+    phish_df['label'] = 1
+    
+    # Tranco list doesn't have a header, so we name the column
+    legit_df = pd.read_csv('data/legitimate_urls.csv', header=None, names=['rank', 'url'])
+    legit_df['url'] = legit_df['url'].apply(lambda x: 'http://' + x)
+    legit_df['label'] = 0
+    min_samples = min(len(phish_df), len(legit_df))
+    phish_df = phish_df.sample(n=min_samples, random_state=42)
+    legit_df = legit_df.sample(n=min_samples, random_state=42)
+
+except FileNotFoundError as e:
+    print(f"Error: {e}")
+    print("Please make sure you have downloaded the datasets and placed them in the 'data/' directory.")
+    exit()
+
+# Combine and shuffle the data
+df = pd.concat([phish_df[['url', 'label']], legit_df[['url', 'label']]], ignore_index=True)
+df = df.sample(frac=1, random_state=42).reset_index(drop=True)
+
+# Clean data
+df.drop_duplicates(subset=['url'], inplace=True)
+df.dropna(inplace=True)
+
+print(f"Data loaded successfully. Total samples: {len(df)}")
+print(f"Phishing samples: {len(df[df['label'] == 1])}, Legitimate samples: {len(df[df['label'] == 0])}")
+
+
+# =====================================================================
+# 2. Feature Engineering
+# =====================================================================
+
+print("Step 2: Performing feature engineering...")
+
+# Pre-compiled regex for efficiency
+IP_RE = re.compile(r'^\d{1,3}(?:\.\d{1,3}){3}$')
+KEYWORDS = ['login', 'secure', 'account', 'verify', 'update', 'signin', 'bank', 'paypal', 'confirm', 'password']
+
+def normalize_url(url: str) -> str:
+    """Ensure URL has a scheme for proper parsing."""
+    url = url.strip()
+    if '://' not in url:
+        url = 'http://' + url
+    return url
+
+def extract_lexical(url: str) -> dict:
+    """Extracts lexical features from a URL."""
+    features = {}
+    url = normalize_url(url)
+    try:
+        parsed = urlparse(url)
+        hostname = parsed.hostname or ''
+        path = parsed.path or ''
+    except:
+        # Handle potential parsing errors for malformed URLs
+        hostname = ''
+        path = ''
+
+    # Basic length features
+    features['url_length'] = len(url)
+    features['hostname_length'] = len(hostname)
+    features['path_length'] = len(path)
+
+    # Counting features
+    features['special_char_count'] = url.count('.') + url.count('/') + url.count('-') + url.count('=') + url.count('?') + url.count('&')
+    features['subdomain_count'] = hostname.count('.')
+    features['path_depth'] = path.count('/')
+
+    # Boolean/Binary features
+    features['contains_ip'] = 1 if IP_RE.match(hostname) else 0
+    features['contains_https'] = 1 if parsed.scheme == 'https' else 0
+
+    # Keyword features
+    low_url = url.lower()
+    for k in KEYWORDS:
+        features[f'kw_{k}'] = 1 if k in low_url else 0
+
+    return features
+
+# Apply feature extraction
+lexical_features = df['url'].apply(extract_lexical)
+lex_df = pd.DataFrame(lexical_features.tolist())
+lex_cols = lex_df.columns.tolist() # Save column order
+
+# =====================================================================
+# 3. Model Training
+# =====================================================================
+
+print("Step 3: Training the model...")
+
+# TF-IDF Vectorization for URL string
+tfidf = TfidfVectorizer(analyzer='char', ngram_range=(3, 5), max_features=10000)
+X_tfidf = tfidf.fit_transform(df['url'])
+
+# Scaling for Lexical Features
+scaler = StandardScaler()
+X_lex_scaled = scaler.fit_transform(lex_df)
+
+# Combine features
+X = hstack([X_tfidf, X_lex_scaled])
+y = df['label']
+
+# Train-test split
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+
+# Train LightGBM model
+lgbm = lgb.LGBMClassifier(objective='binary', random_state=42)
+lgbm.fit(X_train, y_train)
+
+# =====================================================================
+# 4. Evaluation
+# =====================================================================
+
+print("Step 4: Evaluating the model...")
+y_pred = lgbm.predict(X_test)
+
+print(f"Accuracy: {accuracy_score(y_test, y_pred):.4f}")
+print(f"Precision: {precision_score(y_test, y_pred):.4f}")
+print(f"Recall: {recall_score(y_test, y_pred):.4f}")
+print(f"F1-score: {f1_score(y_test, y_pred):.4f}")
+print("Confusion Matrix:")
+print(confusion_matrix(y_test, y_pred))
+
+# =====================================================================
+# 5. Saving Artifacts
+# =====================================================================
+
+print("Step 5: Saving model and preprocessing artifacts...")
+
+# Create the models directory if it doesn't exist
+os.makedirs('models', exist_ok=True)
+
+# Save the artifacts
+joblib.dump(lgbm, 'models/model.joblib')
+joblib.dump(tfidf, 'models/tfidf.joblib')
+joblib.dump(scaler, 'models/scaler.joblib')
+joblib.dump(lex_cols, 'models/lex_cols.joblib')
+
+print("\nTraining complete! All artifacts have been saved to the 'models/' directory.")
+print("You can now run the Streamlit app.")
