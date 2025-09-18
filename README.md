@@ -1,5 +1,15 @@
-🛡️ Intelligent Phishing Detector
-An advanced, real-time phishing URL detector powered by a multi-layered AI model and a dynamic Streamlit user interface. This project goes beyond simple lexical analysis to perform live background checks on domains (WHOIS) and security certificates (SSL) to make highly accurate, context-aware predictions.
+<h1 align="center">🛡️ Intelligent Phishing Detector</h1>
+<h3 align="center">A Multi-Layered AI Phishing Detection System with Live Analysis</h3>
+
+<p align="center">
+<em>An advanced, real-time phishing URL detector powered by a multi-layered AI model and a dynamic Streamlit user interface. This project goes beyond simple lexical analysis to perform live background checks on domains (WHOIS) and security certificates (SSL) to make highly accurate, context-aware predictions.</em>
+</p>
+
+<div align="center">
+
+(Note: You can replace the link above with a real screenshot of your app once it's running.)
+
+</div>
 
 ✨ Key Features
 Multi-Layered Analysis: Combines three layers of evidence for maximum accuracy:
@@ -85,9 +95,7 @@ venv\Scripts\activate
 source venv/bin/activate
 
 # Install all required packages
-pip install -r requirements.txt
-
-(Note: You can create the requirements.txt file by running pip freeze > requirements.txt in your active venv.)
+pip install streamlit pandas scikit-learn lightgbm joblib tqdm python-whois pyopenssl tldextract plotly
 
 3. Data Acquisition
 You need to download the raw datasets and place them in the data/ folder:
@@ -97,7 +105,7 @@ Phishing URLs: Download verified_online.csv from PhishTank and rename it to phis
 Legitimate URLs: Download the top 1 million list from Tranco and rename it to legitimate_urls.csv.
 
 4. Running the Full Workflow
-Run the scripts in the following order:
+Run the scripts from your terminal in the following order:
 
 Step 1: Merge the raw datasets (fast)
 
@@ -123,6 +131,3 @@ Asynchronous Lookups: Convert the live WHOIS/SSL lookups to be asynchronous to p
 Expanded Whitelist: Integrate a larger, more comprehensive list of trusted domains and TLDs.
 
 Scheduled Retraining: In a production environment, automate the enrich_data.py and train_model.py scripts to run periodically to keep the model up-to-date with new threats.
-
-📜 License
-This project is licensed under the MIT License. See the LICENSE file for details.
