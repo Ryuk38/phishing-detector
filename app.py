@@ -1,5 +1,3 @@
-# app.py (Modern AI-Powered Theme with Go-Inspired UI/UX)
-
 import streamlit as st
 import joblib
 import pandas as pd
@@ -13,6 +11,13 @@ import socket
 from OpenSSL import crypto
 import tldextract
 import plotly.graph_objects as go
+import unicodedata
+import requests
+import time
+
+# --- IMPORTANT: PASTE YOUR VIRUSTOTAL API KEY HERE ---
+VT_API_KEY = "be75fa188b9ced96b3cd54efef09b5ae8ce94179be351407b500a505fd52f5e3"
+# ----------------------------------------------------
 
 # --- 1. RESOURCE LOADING ---
 @st.cache_resource
@@ -43,17 +48,62 @@ enriched_data_cache = load_enriched_data_cache()
 # --- 2. FEATURE EXTRACTION & ANALYSIS FUNCTIONS ---
 @st.cache_data(ttl=3600)
 def get_live_advanced_features(url):
+    """Performs all live lookups: WHOIS, SSL, and VirusTotal."""
     hostname = extract_hostname(url)
     if hostname:
         whois_info = get_whois_features(hostname)
         ssl_info = get_ssl_features(hostname)
-        return {**whois_info, **ssl_info}
-    return {'domain_age_days': -1, 'domain_lifespan_days': -1, 'has_ssl': 0, 'cert_issuer': 'None', 'cert_validity_days': -1}
+        vt_info = get_virustotal_report(url)
+        return {**whois_info, **ssl_info, **vt_info}
+    return {
+        'domain_age_days': -1, 'domain_lifespan_days': -1, 'has_ssl': 0, 
+        'cert_issuer': 'None', 'cert_validity_days': -1,
+        'vt_malicious_votes': 0, 'vt_total_votes': 0
+    }
+
+def get_virustotal_report(url_to_scan):
+    """Queries the VirusTotal API for a URL report."""
+    defaults = {'vt_malicious_votes': 0, 'vt_total_votes': 0}
+    if not VT_API_KEY or VT_API_KEY == "YOUR_VIRUSTOTAL_API_KEY_HERE":
+        st.sidebar.warning("VirusTotal API key not configured. Skipping threat intelligence check.", icon="⚠️")
+        return defaults
+    
+    try:
+        url_id = urlparse(url_to_scan).geturl()
+        report_url = f"https://www.virustotal.com/api/v3/urls/{url_id}"
+        headers = {"x-apikey": VT_API_KEY}
+        
+        # First, try to get a report directly
+        response = requests.get(report_url, headers=headers)
+        
+        # If not found, submit for analysis
+        if response.status_code == 404:
+            scan_url = 'https://www.virustotal.com/api/v3/urls'
+            payload = {"url": url_to_scan}
+            response = requests.post(scan_url, data=payload, headers=headers)
+            response.raise_for_status()
+            analysis_id = response.json()['data']['id']
+            # Free API is slow, we must wait for the analysis to complete
+            st.sidebar.info("URL not in VirusTotal DB. Submitting for analysis... (this will take ~20s)", icon="⏳")
+            time.sleep(20)
+            report_url = f'https://www.virustotal.com/api/v3/analyses/{analysis_id}'
+            response = requests.get(report_url, headers=headers)
+
+        response.raise_for_status()
+        
+        stats = response.json().get('data', {}).get('attributes', {}).get('last_analysis_stats', {})
+        return {
+            'vt_malicious_votes': stats.get('malicious', 0),
+            'vt_total_votes': sum(stats.values())
+        }
+    except Exception as e:
+        st.sidebar.error(f"VirusTotal API Error: {e}", icon="🚨")
+        return defaults
 
 def extract_hostname(url: str) -> str:
     try:
         if '://' not in url: url = 'http://' + url
-        return urlparse(url).hostname
+        return urlparse(url).hostname.lower() if urlparse(url).hostname else ""
     except: return ""
 
 def get_whois_features(hostname: str) -> dict:
@@ -78,7 +128,7 @@ def get_ssl_features(hostname: str) -> dict:
             with context.wrap_socket(sock, server_hostname=hostname) as ssock:
                 cert_der = ssock.getpeercert(binary_form=True)
                 cert = crypto.load_certificate(crypto.FILETYPE_ASN1, cert_der)
-                issuer_org = cert.get_issuer().O if cert.get_issuer().O else 'None'
+                issuer_org = dict(cert.get_issuer().get_components()).get(b'O', b'').decode(errors='ignore') or 'None'
                 not_before = datetime.strptime(cert.get_notBefore().decode('ascii'), '%Y%m%d%H%M%SZ')
                 not_after = datetime.strptime(cert.get_notAfter().decode('ascii'), '%Y%m%d%H%M%SZ')
                 validity_days = (not_after - not_before).days
@@ -90,209 +140,287 @@ KEYWORDS = ['login', 'secure', 'account', 'verify', 'update', 'signin', 'bank', 
 def extract_lexical(url: str) -> dict:
     features = {}; url = str(url).strip()
     if '://' not in url: url = 'http://' + url
-    parsed = urlparse(url); hostname = parsed.hostname or ''; path = parsed.path or ''
+    parsed = urlparse(url); hostname = (parsed.hostname or "").lower(); path = parsed.path or ''
     features['url_length'] = len(url); features['hostname_length'] = len(hostname); features['path_length'] = len(path)
     features['special_char_count'] = url.count('.') + url.count('/') + url.count('-') + url.count('=') + url.count('?') + url.count('&')
-    features['subdomain_count'] = hostname.count('.'); features['path_depth'] = path.count('/')
+    features['subdomain_count'] = max(0, hostname.count('.') - 1) if hostname else 0
+    features['path_depth'] = len([p for p in path.split('/') if p])
     features['contains_ip'] = 1 if IP_RE.match(hostname) else 0; features['contains_https'] = 1 if parsed.scheme == 'https' else 0
     low_url = url.lower()
     for k in KEYWORDS: features[f'kw_{k}'] = 1 if k in low_url else 0
     return features
 
+def detect_homograph_attack(hostname: str) -> dict:
+    results = {'is_punycode': 0, 'suspicious_chars_found': 0, 'ascii_substitutions': [], 'unicode_confusables': []}
+    if not hostname: return results
+    hostname_l = hostname.lower()
+    if hostname_l.startswith('xn--') or 'xn--' in hostname_l: results['is_punycode'] = 1
+    homograph_map = {'o': ['0'], 'l': ['1', 'i'], 'e': ['3'], 'a': ['4', '@'], 's': ['5', '$'], 'g': ['9'], 't': ['7']}
+    for letter, subs in homograph_map.items():
+        for sub in subs:
+            if sub in hostname_l: results['ascii_substitutions'].append(f"'{sub}' for '{letter}'")
+    suspicious_scripts = ["CYRILLIC", "GREEK", "ARMENIAN", "HEBREW", "ARABIC"]
+    for ch in hostname:
+        try:
+            name = unicodedata.name(ch)
+            if any(script in name for script in suspicious_scripts):
+                results['unicode_confusables'].append(f"{ch} ({name})")
+        except ValueError: continue
+    if results['is_punycode'] or results['ascii_substitutions'] or results['unicode_confusables']:
+        results['suspicious_chars_found'] = 1
+    return results
+
 # --- 3. POST-PREDICTION & REPORTING LAYER ---
-SAFE_DOMAINS = {"google.com", "amazon.com", "microsoft.com", "apple.com", "kristujayanti.edu.in", "facebook.com", "wikipedia.org"}
+SAFE_DOMAINS = {"google.com", "amazon.com", "microsoft.com", "apple.com", "kristujayanti.edu.in", "facebook.com", "wikipedia.org", "github.dev"}
 TRUSTED_ISSUERS = ["amazon", "google", "digicert", "globalsign", "sectigo", "godaddy", "microsoft"]
 
 def is_safe_domain(hostname):
     if not hostname: return False
     extracted = tldextract.extract(hostname)
-    registered_domain = f"{extracted.domain}.{extracted.suffix}"
+    if not extracted.suffix: return False
+    registered_domain = f"{extracted.domain}.{extracted.suffix}".lower()
     return registered_domain in SAFE_DOMAINS
 
-def adjust_prediction(features, raw_proba):
-    adjusted_proba = raw_proba
+def adjust_prediction(features, raw_proba, homograph_features):
+    adjusted_proba = float(raw_proba)
+    # --- NEW: VirusTotal is hard evidence ---
+    if features.get("vt_malicious_votes", 0) > 1:
+        return 0.99 # If >1 security vendor flags it, force high risk
+        
     domain_age = features.get("domain_age_days", -1); has_ssl = features.get("has_ssl", 0)
-    cert_issuer = features.get("cert_issuer", "").lower(); hostname = features.get("hostname", "")
+    cert_issuer = (features.get("cert_issuer") or "").lower(); hostname = (features.get("hostname") or "").lower()
     if is_safe_domain(hostname): return 0.01
-    if domain_age > 365 * 2 and has_ssl == 1 and any(ti in cert_issuer for ti in TRUSTED_ISSUERS): adjusted_proba *= 0.3
-    if domain_age > 365 * 5: adjusted_proba *= 0.5
+    if domain_age > 730 and has_ssl == 1 and any(ti in cert_issuer for ti in TRUSTED_ISSUERS): adjusted_proba *= 0.3
+    if domain_age > 1825: adjusted_proba *= 0.5
     suspicious_keywords = [k for k, v in features.items() if k.startswith("kw_") and v == 1]
     if has_ssl == 1 and not suspicious_keywords: adjusted_proba *= 0.7
-    return min(max(adjusted_proba, 0), 1)
+    if homograph_features.get('is_punycode'): adjusted_proba = min(adjusted_proba * 1.4, 1.0)
+    if homograph_features.get('suspicious_chars_found'): adjusted_proba = min(adjusted_proba * 1.25, 1.0)
+    return float(min(max(adjusted_proba, 0.0), 1.0))
 
 def create_risk_gauge(score):
     percentage = score * 100
-    if score >= 0.7: color, label = "#FF4C4C", "High Risk"
-    elif score >= 0.3: color, label = "#FFAA33", "Suspicious"
-    else: color, label = "#00CC99", "Low Risk"
+    if score >= 0.7: color, label = "#EF4444", "High Risk"
+    elif score >= 0.3: color, label = "#F59E0B", "Suspicious"
+    else: color, label = "#10B981", "Low Risk"
     
     fig = go.Figure(go.Indicator(
         mode="gauge+number",
         value=percentage,
-        number={'suffix': "%", "font": {"size": 48, "color": "#1E293B", "family": "Inter, sans-serif"}},
+        number={'suffix': "%", "font": {"size": 40, "color": "#E5E7EB", "family": "Inter, sans-serif"}},
         gauge={
-            'axis': {'range': [0, 100], 'tickwidth': 1, 'tickcolor': "#1E293B", 'tickfont': {'family': 'Inter, sans-serif'}},
+            'axis': {'range': [0, 100], 'tickwidth': 1, 'tickcolor': "#E5E7EB", 'tickfont': {'family': 'Inter, sans-serif'}},
             'bar': {'color': color, 'thickness': 0.2},
-            'bgcolor': "#F8FAFC",
+            'bgcolor': "#1F2937",
             'borderwidth': 1,
-            'bordercolor': "#E2E8F0",
+            'bordercolor': "#374151",
             'steps': [
-                {'range': [0, 30], 'color': 'rgba(0, 204, 153, 0.1)'},
-                {'range': [30, 70], 'color': 'rgba(255, 170, 51, 0.1)'},
-                {'range': [70, 100], 'color': 'rgba(255, 76, 76, 0.1)'}],
+                {'range': [0, 30], 'color': 'rgba(16, 185, 129, 0.1)'},
+                {'range': [30, 70], 'color': 'rgba(245, 158, 11, 0.1)'},
+                {'range': [70, 100], 'color': 'rgba(239, 68, 68, 0.1)'}],
             'threshold': {
                 'line': {'color': color, 'width': 4},
                 'thickness': 0.75,
                 'value': percentage
             }
         },
-        title={'text': f"<b>{label}</b>", "font": {"size": 28, "color": color, "family": "Inter, sans-serif"}}
+        title={'text': f"<b>{label}</b>", "font": {"size": 24, "color": color, "family": "Inter, sans-serif"}}
     ))
     fig.update_layout(
-        paper_bgcolor="#F8FAFC",
+        paper_bgcolor="rgba(0,0,0,0)",
         margin=dict(l=20, r=20, t=50, b=20),
-        height=300,
+        height=250,
         font={'family': 'Inter, sans-serif'}
     )
     return fig
 
+def generate_report(features, homograph_features):
+    risk_factors, trust_signals = [], []
+    # --- NEW: VirusTotal is a key risk factor ---
+    vt_votes = features.get("vt_malicious_votes", 0)
+    if vt_votes > 1:
+        risk_factors.append(f"**VirusTotal Flagged:** Marked as malicious by **{vt_votes}** security vendors.")
+
+    if homograph_features.get('is_punycode'): risk_factors.append("URL uses Punycode to hide characters")
+    if homograph_features.get('ascii_substitutions'): risk_factors.append(f"Character substitutions detected: {', '.join(homograph_features['ascii_substitutions'])}")
+    if homograph_features.get('unicode_confusables'): risk_factors.append(f"Unicode confusables detected: {', '.join(homograph_features['unicode_confusables'])}")
+    kw = [k.replace('kw_', '') for k, v in features.items() if k.startswith('kw_') and v]
+    if kw: risk_factors.append(f"Suspicious keywords: {', '.join(kw)}")
+    if not features.get("contains_https"): risk_factors.append("No HTTPS detected")
+    age = features.get("domain_age_days", -1)
+    if age != -1 and age < 180: risk_factors.append(f"New domain ({age} days old)")
+    if features.get("contains_https"): trust_signals.append("Secured with HTTPS")
+    if age > 730: trust_signals.append("Well-established domain")
+    issuer = (features.get("cert_issuer", "") or "").lower()
+    if any(ti in issuer for ti in TRUSTED_ISSUERS): trust_signals.append(f"Trusted SSL issuer: {features['cert_issuer']}")
+    return risk_factors, trust_signals
+
 # --- 4. STREAMLIT UI ---
 st.set_page_config(
-    page_title="🛡️ AI-Powered Phishing Detector",
+    page_title="🛡️ CyberGuard Phishing Detector",
     page_icon="🛡️",
     layout="centered",
     initial_sidebar_state="collapsed"
 )
 
-# Custom CSS for modern, Go-inspired, AI-powered theme
+# Custom CSS for premium, developer-friendly UI with new background
 st.markdown("""
 <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
 
-    body, .stApp {
-        background: linear-gradient(135deg, #F0F4FF 0%, #E6EFFF 100%);
-        color: #1E293B;
+    .stApp {
+        background: linear-gradient(rgba(0, 0, 0, 0.7), rgba(0, 0, 0, 0.7)), url('https://images.unsplash.com/photo-1558494949-ef010cbdcc31?auto=format&fit=crop&w=1920&q=80');
+        background-size: cover;
+        background-position: center;
+        background-attachment: fixed;
+        color: #E5E7EB;
         font-family: 'Inter', sans-serif;
-        margin: 0;
-        padding: 0;
+        min-height: 100vh;
+        padding: 2rem;
+    }
+
+    .main-container {
+        background: rgba(17, 24, 39, 0.95);
+        border-radius: 16px;
+        padding: 2rem;
+        box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+        backdrop-filter: blur(10px);
+        margin: 0 auto;
+        max-width: 900px;
+        transition: all 0.3s ease;
     }
 
     .stTextInput > div > div > input {
-        background: #FFFFFF;
-        border: 1px solid #CBD5E1;
-        border-radius: 12px;
-        padding: 14px 16px;
+        background: #1F2937;
+        border: 1px solid #374151;
+        border-radius: 8px;
+        padding: 12px 16px;
         font-size: 16px;
-        color: #1E293B;
+        color: #E5E7EB;
         transition: all 0.3s ease;
     }
     .stTextInput > div > div > input:focus {
         border-color: #3B82F6;
-        box-shadow: 0 0 8px rgba(59, 130, 246, 0.3);
+        box-shadow: 0 0 8px rgba(59, 130, 246, 0.5);
         outline: none;
+    }
+    .stTextInput > div > div > input:hover {
+        border-color: #60A5FA;
+        transform: translateY(-2px);
     }
 
     .stButton > button {
-        background: linear-gradient(90deg, #3B82F6 0%, #7C3AED 100%);
+        background: #3B82F6;
         color: #FFFFFF;
         font-weight: 600;
-        border-radius: 12px;
-        padding: 12px 32px;
+        border-radius: 8px;
+        padding: 12px 24px;
         font-size: 16px;
         border: none;
         transition: all 0.3s ease;
-        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+        box-shadow: 0 4px 12px rgba(59, 130, 246, 0.3);
     }
     .stButton > button:hover {
+        background: #2563EB;
         transform: translateY(-2px);
-        box-shadow: 0 4px 12px rgba(59, 130, 246, 0.3);
-        background: linear-gradient(90deg, #2563EB 0%, #6B21A8 100%);
+        box-shadow: 0 6px 16px rgba(59, 130, 246, 0.5);
     }
 
-    .stContainer {
-        background: #FFFFFF;
-        border-radius: 16px;
-        padding: 24px;
-        box-shadow: 0 4px 16px rgba(0, 0, 0, 0.05);
-        margin-bottom: 24px;
-    }
-
-    .risk-chip {
-        background: rgba(255, 76, 76, 0.1);
-        color: #B91C1C;
+    .chip {
         padding: 8px 12px;
-        border-radius: 10px;
+        border-radius: 8px;
         margin: 6px;
         display: inline-block;
         font-weight: 500;
         font-size: 14px;
+        transition: transform 0.2s ease;
+    }
+    .risk-chip {
+        background: rgba(239, 68, 68, 0.2);
+        color: #FCA5A5;
     }
     .trust-chip {
-        background: rgba(0, 204, 153, 0.1);
-        color: #047857;
-        padding: 8px 12px;
-        border-radius: 10px;
-        margin: 6px;
-        display: inline-block;
-        font-weight: 500;
-        font-size: 14px;
+        background: rgba(16, 185, 129, 0.2);
+        color: #6EE7B7;
+    }
+    .chip:hover {
+        transform: scale(1.05);
     }
 
-    .stMarkdown h1, .stMarkdown h2, .stMarkdown h3 {
-        color: #1E293B;
-        font-weight: 700;
-    }
     .stMarkdown h1 {
-        font-size: 36px;
-        margin-bottom: 16px;
+        font-size: 32px;
+        font-weight: 700;
+        color: #FFFFFF;
+        text-align: center;
+        margin-bottom: 1rem;
+        animation: fadeIn 1s ease-in;
     }
     .stMarkdown h2 {
         font-size: 24px;
-        margin-top: 24px;
-        margin-bottom: 16px;
+        font-weight: 600;
+        color: #D1D5DB;
+        margin-top: 1.5rem;
     }
 
     .stExpander {
-        background: #F8FAFC;
-        border-radius: 12px;
-        border: 1px solid #E2E8F0;
+        background: #1F2937;
+        border-radius: 8px;
+        border: 1px solid #374151;
+        transition: all 0.3s ease;
+    }
+    .stExpander:hover {
+        border-color: #4B5563;
+        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
     }
 
     .final-verdict {
         padding: 16px;
-        border-radius: 12px;
+        border-radius: 8px;
         font-weight: 600;
         font-size: 18px;
         text-align: center;
+        animation: slideIn 0.5s ease;
     }
     .high-risk {
-        background: rgba(255, 76, 76, 0.1);
-        color: #B91C1C;
-        border: 1px solid #FECACA;
+        background: rgba(239, 68, 68, 0.2);
+        color: #FCA5A5;
+        border: 1px solid #EF4444;
     }
     .suspicious {
-        background: rgba(255, 170, 51, 0.1);
-        color: #B45309;
-        border: 1px solid #FCD34D;
+        background: rgba(245, 158, 11, 0.2);
+        color: #FCD34D;
+        border: 1px solid #F59E0B;
     }
     .safe {
-        background: rgba(0, 204, 153, 0.1);
-        color: #047857;
-        border: 1px solid #6EE7B7;
+        background: rgba(16, 185, 129, 0.2);
+        color: #6EE7B7;
+        border: 1px solid #10B981;
+    }
+
+    @keyframes fadeIn {
+        from { opacity: 0; transform: translateY(-20px); }
+        to { opacity: 1; transform: translateY(0); }
+    }
+    @keyframes slideIn {
+        from { opacity: 0; transform: translateX(-20px); }
+        to { opacity: 1; transform: translateX(0); }
     }
 
     /* Responsive Design */
     @media (max-width: 640px) {
+        .main-container {
+            padding: 1.5rem;
+        }
         .stTextInput > div > div > input {
             font-size: 14px;
-            padding: 12px;
+            padding: 10px;
         }
         .stButton > button {
             width: 100%;
-            padding: 12px;
+            padding: 10px;
         }
         .stMarkdown h1 {
-            font-size: 28px;
+            font-size: 24px;
         }
         .stMarkdown h2 {
             font-size: 20px;
@@ -302,91 +430,77 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # --- 5. STREAMLIT UI ---
-st.title("🛡️ AI-Powered Phishing Detector")
-st.markdown("Enter a URL to run a **multi-layered AI-driven phishing analysis** and receive a comprehensive security report.")
+st.title("🛡️ CyberGuard Phishing Detector")
+st.markdown("Analyze URLs with **AI-powered phishing detection** and VirusTotal integration for a comprehensive security report.")
 
 if not all([model, tfidf, scaler, feature_cols]):
     st.error("🚨 Model artifacts not found! Please run `train_model.py` first.")
 else:
     with st.container():
+        st.markdown('<div class="main-container">', unsafe_allow_html=True)
         url_input = st.text_input("🔗 Enter URL to Analyze:", placeholder="https://example.com")
         if st.button("Analyze URL"):
             if not url_input:
                 st.warning("Please enter a URL to analyze.")
             else:
-                with st.spinner("🔍 Performing AI-powered analysis..."):
+                with st.spinner("🔍 Running AI-powered analysis... This may take up to 30 seconds for new URLs."):
                     hostname = extract_hostname(url_input)
                     lexical_features = extract_lexical(url_input)
-
+                    homograph_features = detect_homograph_attack(hostname)
                     if enriched_data_cache is not None and hostname in enriched_data_cache.index:
-                        advanced_features = enriched_data_cache.loc[hostname].to_dict()
+                        cached_data = enriched_data_cache.loc[hostname].to_dict()
+                        advanced_features = {**cached_data, 'vt_malicious_votes': 0, 'vt_total_votes': 0} # Assume cached are safe from VT
                         source = "Pre-computed Knowledge Base"
                     else:
                         advanced_features = get_live_advanced_features(url_input)
                         source = "Live Network Lookup"
-
                     all_features_for_report = {**lexical_features, **advanced_features, 'hostname': hostname}
-                    
                     model_input_df = pd.DataFrame(0, index=[0], columns=feature_cols)
                     for col, value in all_features_for_report.items():
                         if col in model_input_df.columns: model_input_df.at[0, col] = value
                     issuer_col = f"issuer_{advanced_features.get('cert_issuer', 'None')}"
                     if issuer_col in model_input_df.columns: model_input_df.at[0, issuer_col] = 1
-
                     X_numerical_scaled = scaler.transform(model_input_df)
                     X_tfidf = tfidf.transform([url_input])
                     X = hstack([X_tfidf, X_numerical_scaled])
-
                     raw_proba = model.predict_proba(X)[0, 1]
-                    final_proba = adjust_prediction(all_features_for_report, raw_proba)
+                    final_proba = adjust_prediction(all_features_for_report, raw_proba, homograph_features)
 
                 st.markdown("---")
-                st.subheader("📊 Analysis Report Card")
-
-                # Main report card container
+                st.subheader("📊 Security Report")
                 with st.container():
                     fig = create_risk_gauge(final_proba)
                     st.plotly_chart(fig, use_container_width=True)
-
-                    risk_factors = []
-                    trust_signals = []
-                    if any(v == 1 for k, v in lexical_features.items() if k.startswith("kw_")):
-                        kw = [k.replace('kw_', '') for k, v in lexical_features.items() if k.startswith("kw_") and v == 1]
-                        risk_factors.append(f"Contains suspicious keywords: **{', '.join(kw)}**")
-                    if not lexical_features.get("contains_https", False): risk_factors.append("No HTTPS detected")
-                    age = advanced_features.get("domain_age_days", -1)
-                    if age != -1 and age < 180: risk_factors.append(f"Very new domain ({age} days old)")
-                    
-                    if lexical_features.get("contains_https", False): trust_signals.append("Uses HTTPS connection")
-                    if age > 365*2: trust_signals.append("Domain is well-established")
-                    issuer = advanced_features.get("cert_issuer", "").lower()
-                    if any(ti in issuer for ti in TRUSTED_ISSUERS): trust_signals.append(f"Trusted SSL issuer: **{advanced_features['cert_issuer']}**")
-                    
+                    risk_factors, trust_signals = generate_report(all_features_for_report, homograph_features)
                     col1, col2 = st.columns(2)
                     with col1:
-                        st.markdown("#### 🚨 Risk Factors")
+                        st.markdown("#### 🚨 Risk Indicators")
                         if risk_factors:
-                            for rf in risk_factors: st.markdown(f"<div class='risk-chip'>⚠️ {rf}</div>", unsafe_allow_html=True)
+                            for rf in risk_factors: st.markdown(f"<div class='chip risk-chip'>⚠️ {rf}</div>", unsafe_allow_html=True)
                         else:
-                            st.markdown("<div class='trust-chip'>✅ No major risk factors found.</div>", unsafe_allow_html=True)
+                            st.markdown("<div class='chip trust-chip'>✅ No significant risks detected.</div>", unsafe_allow_html=True)
                     with col2:
-                        st.markdown("#### ✅ Trust Signals")
+                        st.markdown("#### ✅ Trust Indicators")
                         if trust_signals:
-                            for ts in trust_signals: st.markdown(f"<div class='trust-chip'>🔒 {ts}</div>", unsafe_allow_html=True)
+                            for ts in trust_signals: st.markdown(f"<div class='chip trust-chip'>🔒 {ts}</div>", unsafe_allow_html=True)
                         else:
-                            st.markdown("<div class='risk-chip'>⚠️ No significant trust signals detected.</div>", unsafe_allow_html=True)
-                    
-                    st.markdown("---")
-                    
-                    # Final Verdict Badge
+                            st.markdown("<div class='chip risk-chip'>⚠️ No strong trust signals found.</div>", unsafe_allow_html=True)
                     verdict_class = "high-risk" if final_proba >= 0.7 else "suspicious" if final_proba >= 0.3 else "safe"
+                    verdict_icon = "🚨" if final_proba >= 0.7 else "⚠️" if final_proba >= 0.3 else "✅"
                     verdict_text = (
-                        "This URL is classified as a HIGH PHISHING RISK." if final_proba >= 0.7 else
-                        "This URL is SUSPICIOUS. Please proceed with extreme caution." if final_proba >= 0.3 else
-                        "This URL appears to be SAFE."
+                        "HIGH PHISHING RISK DETECTED!" if final_proba >= 0.7 else
+                        "SUSPICIOUS URL - Proceed with caution." if final_proba >= 0.3 else
+                        "URL appears SAFE."
                     )
-                    st.markdown(f"<div class='final-verdict {verdict_class}'>{verdict_text}</div>", unsafe_allow_html=True)
+                    st.markdown(f"<div class='final-verdict {verdict_class}'>{verdict_icon} {verdict_text}</div>", unsafe_allow_html=True)
 
-                with st.expander("🔍 View Technical Details"):
-                    st.metric("Raw Model Score (before safety net)", f"{raw_proba:.2%}")
-                    st.json({"Lexical Features": lexical_features, "Enrichment Features": advanced_features, "Source": source})
+                with st.expander("🔍 Technical Details"):
+                    st.metric("Raw Model Score", f"{raw_proba:.2%}")
+                    st.json({
+                        "Lexical Features": lexical_features, 
+                        "Enrichment Features": advanced_features, 
+                        "Homograph Features": homograph_features, 
+                        "Source": source
+                    })
+        
+        st.markdown('</div>', unsafe_allow_html=True)
