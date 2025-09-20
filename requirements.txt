@@ -1,0 +1,11 @@
+streamlit
+pandas
+scikit-learn
+lightgbm
+joblib
+tqdm
+python-whois
+pyopenssl
+tldextract
+plotly
+whois
