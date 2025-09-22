@@ -741,11 +741,3 @@ if 'results' in st.session_state:
         st.json(results['homograph_features'])
     
     st.markdown('</div>', unsafe_allow_html=True)
-
-# --- FOOTER ---
-st.markdown("""
-<div class="footer">
-    <p>🛡️ CyberGuard AI leverages advanced machine learning, VirusTotal, Google Safe Browsing, and homograph detection to protect you from phishing threats.</p>
-    <p><a href="#">Privacy Policy</a> | <a href="#">Terms of Service</a></p>
-</div>
-""", unsafe_allow_html=True)
