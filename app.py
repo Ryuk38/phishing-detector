@@ -17,6 +17,7 @@ import warnings
 import hashlib
 import tranco
 import logging
+from whois.parser import PywhoisError
 
 # Set up logging
 logging.basicConfig(level=logging.DEBUG)
@@ -204,18 +205,50 @@ def extract_hostname(url: str) -> str:
 def get_whois_features(hostname: str) -> dict:
     defaults = {'domain_age_days': -1, 'domain_lifespan_days': -1}
     try:
+        logger.debug(f"Attempting WHOIS lookup for {hostname}")
         w = whois.whois(hostname)
-        creation_date = w.creation_date[0] if isinstance(w.creation_date, list) else w.creation_date
-        expiration_date = w.expiration_date[0] if isinstance(w.expiration_date, list) else w.expiration_date
-        if creation_date and expiration_date:
-            now = datetime.now()
+        logger.debug(f"WHOIS response for {hostname}: {w}")
+        
+        # Handle creation_date
+        creation_date = None
+        if isinstance(w.creation_date, list):
+            creation_date = w.creation_date[0] if w.creation_date else None
+        else:
+            creation_date = w.creation_date
+
+        # Handle expiration_date
+        expiration_date = None
+        if isinstance(w.expiration_date, list):
+            expiration_date = w.expiration_date[0] if w.expiration_date else None
+        else:
+            expiration_date = w.expiration_date
+
+        # Validate dates
+        now = datetime.now()
+        if creation_date and isinstance(creation_date, datetime):
             domain_age = (now - creation_date).days
+        else:
+            logger.warning(f"Invalid or missing creation_date for {hostname}: {creation_date}")
+            domain_age = -1
+
+        if creation_date and expiration_date and isinstance(creation_date, datetime) and isinstance(expiration_date, datetime):
             domain_lifespan = (expiration_date - creation_date).days
+        else:
+            logger.warning(f"Invalid or missing expiration_date for {hostname}: {expiration_date}")
+            domain_lifespan = -1
+
+        if domain_age != -1 or domain_lifespan != -1:
             logger.debug(f"Whois data for {hostname}: age={domain_age}, lifespan={domain_lifespan}")
             return {'domain_age_days': domain_age, 'domain_lifespan_days': domain_lifespan}
+        else:
+            logger.warning(f"No valid WHOIS data for {hostname}")
+            return defaults
+
+    except PywhoisError as e:
+        logger.error(f"WHOIS lookup failed for {hostname}: {e} (PywhoisError)")
         return defaults
     except Exception as e:
-        logger.error(f"Whois lookup failed for {hostname}: {e}")
+        logger.error(f"WHOIS lookup failed for {hostname}: {e}")
         return defaults
 
 def get_ssl_features(hostname: str, url: str) -> dict:
@@ -396,7 +429,7 @@ def is_safe_domain(hostname):
 
 def adjust_prediction(features, raw_proba, homograph_features):
     # Normalize raw_proba to reduce model overconfidence
-    adjusted_proba = float(raw_proba) * 0.3  # Scale down to 0-0.3
+    adjusted_proba = float(raw_proba) * 0.4  # Increased from 0.3 to 0.4
     suspicious_keywords = [k for k, v in features.items() if k.startswith("kw_") and v == 1]
     
     # Strong threat signals
@@ -426,6 +459,12 @@ def adjust_prediction(features, raw_proba, homograph_features):
     if not features.get("has_ssl"):
         adjusted_proba += 0.05
         logger.debug("Added +0.05 for no HTTPS")
+    if features.get("domain_age_days", -1) == -1:
+        adjusted_proba += 0.05
+        logger.debug("Added +0.05 for missing WHOIS data")
+    elif features.get("domain_age_days", -1) < 180:
+        adjusted_proba += 0.15
+        logger.debug("Added +0.15 for very new domain (<180 days)")
     
     # Trust signals
     domain_age = features.get("domain_age_days", -1)
@@ -436,8 +475,8 @@ def adjust_prediction(features, raw_proba, homograph_features):
         adjusted_proba -= 0.2
         logger.debug("Subtracted -0.2 for safe domain")
         if domain_age == -1:
-            domain_age = 731  # Assume >2 years for safe domains
-            logger.debug("Assumed domain age >730 days for safe domain")
+            domain_age = 365  # Reduced from 731 to 365 for conservatism
+            logger.debug("Assumed domain age >365 days for safe domain")
     if has_ssl == 1:
         adjusted_proba -= 0.05
         logger.debug("Subtracted -0.05 for HTTPS")
@@ -475,7 +514,7 @@ def create_risk_gauge(score):
     percentage = score * 100
     if score > 0.75:
         color, label = "#EF4444", "HIGH PHISHING RISK"
-    elif score >= 0.3:
+    elif score >= 0.25:  # Lowered from 0.3 to 0.25
         color, label = "#F59E0B", "SUSPICIOUS"
     else:
         color, label = "#10B981", "SAFE"
@@ -492,9 +531,9 @@ def create_risk_gauge(score):
             'borderwidth': 3,
             'bordercolor': color,
             'steps': [
-                {'range': [0, 30], 'color': "#10B981"},
-                {'range': [30, 70], 'color': "#F59E0B"},
-                {'range': [70, 100], 'color': "#EF4444"}
+                {'range': [0, 25], 'color': "#10B981"},  # Adjusted to match new threshold
+                {'range': [25, 75], 'color': "#F59E0B"},
+                {'range': [75, 100], 'color': "#EF4444"}
             ],
             'threshold': {'line': {'color': color, 'width': 4}, 'thickness': 0.75, 'value': percentage}
         },
@@ -530,8 +569,10 @@ def generate_report(features, homograph_features):
     if not features.get("has_ssl"):
         risk_factors.append("No HTTPS detected")
     age = features.get("domain_age_days", -1)
-    if age != -1 and age < 180:
-        risk_factors.append(f"Very new domain ({age} days old)")
+    if age == -1:
+        risk_factors.append("Unable to retrieve domain age (possible private registration or WHOIS failure)")
+    elif age < 180:
+        risk_factors.append(f"**High Risk**: Very new domain ({age} days old)")
     if features.get("tranco_rank") == 1:
         trust_signals.append("Domain is in the **Tranco Top 1 Million** sites.")
     if features.get("has_ssl"):
@@ -760,16 +801,6 @@ st.markdown("""
     text-shadow: 0 0 10px #00FFFF;
 }
 
-/* Responsive Design */
-@media (max-width: 768px) {
-    .hero-title { font-size: 2rem; }
-    .input-container { padding: 1rem; flex-direction: column; }
-    .report-card { padding: 1rem; }
-    .verdict-text { font-size: 1.4rem; }
-    .stTextInput > div > div > input { width: 100% !important; }
-    .stButton > button { width: 100% !important; margin-top: 0.5rem; }
-}
-
 /* Scroll Animation Script */
 #scroll-script {
     display: none;
@@ -811,91 +842,96 @@ if 'analyzing' not in st.session_state:
 
 with st.container():
     st.markdown('<div class="input-container">', unsafe_allow_html=True)
-    # Dynamic placeholder based on analysis stage
-    if st.session_state.analyzing:
-        if st.session_state.analysis_stage == "lexical":
-            placeholder_text = "🔍 Analyzing URL structure..."
-        elif st.session_state.analysis_stage == "live_data":
-            placeholder_text = "🔍 Fetching live data..."
-        elif st.session_state.analysis_stage == "processing":
-            placeholder_text = "🔍 Processing results..."
-        else:
-            placeholder_text = "🔍 Analyzing URL with AI Threat Intelligence..."
-    else:
-        placeholder_text = "Put link here"
-    
-    url_input = st.text_input(
-        "URL Input",
-        value=st.session_state.url_input_value,
-        placeholder=placeholder_text,
-        key="url_input",
-        label_visibility="collapsed",
-        disabled=st.session_state.analyzing
-    )
-    # Update session state with the current input
-    st.session_state.url_input_value = url_input
-
-    if st.button("🚀 ANALYZE", key="analyze_btn"):
-        if not url_input:
-            st.warning("⚠️ Please enter a URL to analyze.")
-            st.markdown('</div>', unsafe_allow_html=True)
-            st.stop()
-        else:
-            st.session_state.analyzing = True
-            # Clear previous results
-            if 'results' in st.session_state:
-                del st.session_state.results
-            
-            # Stage 1: Lexical Analysis
-            st.session_state.analysis_stage = "lexical"
-            logger.debug("Starting lexical analysis...")
-            hostname = extract_hostname(url_input)
-            lexical_features = extract_lexical(url_input)
-            homograph_features = detect_homograph_attack(hostname, url_input)
-            
-            # Stage 2: Live Data Fetching
-            st.session_state.analysis_stage = "live_data"
-            logger.debug("Starting live data fetching...")
-            if enriched_data_cache is not None and hostname in enriched_data_cache.index:
-                cached_data = enriched_data_cache.loc[hostname].to_dict()
-                advanced_features = {**cached_data, 'vt_malicious_votes': 0, 'gsb_threat_type': 'THREAT_TYPE_UNSPECIFIED', 'tranco_rank': get_tranco_rank(hostname).get('tranco_rank')}
-                source = "Pre-computed Knowledge Base"
+    with st.form(key="url_form"):
+        # Dynamic placeholder based on analysis stage
+        if st.session_state.analyzing:
+            if st.session_state.analysis_stage == "lexical":
+                placeholder_text = "🔍 Analyzing URL structure..."
+            elif st.session_state.analysis_stage == "live_data":
+                placeholder_text = "🔍 Fetching live data..."
+            elif st.session_state.analysis_stage == "processing":
+                placeholder_text = "🔍 Processing results..."
             else:
-                advanced_features = get_live_advanced_features(url_input, hostname)
-                source = "Live Network Lookup"
-            
-            # Stage 3: Processing
-            st.session_state.analysis_stage = "processing"
-            logger.debug("Processing features for prediction...")
-            all_features_for_report = {**lexical_features, **advanced_features, 'hostname': hostname}
-            
-            model_input_df = pd.DataFrame(0, index=[0], columns=feature_cols)
-            for col, value in all_features_for_report.items():
-                if col in model_input_df.columns: 
-                    model_input_df.at[0, col] = value
-            issuer_col = f"issuer_{advanced_features.get('cert_issuer', 'None')}"
-            if issuer_col in model_input_df.columns: 
-                model_input_df.at[0, issuer_col] = 1
-            
-            X_numerical_scaled = scaler.transform(model_input_df[feature_cols])
-            X_tfidf = tfidf.transform([url_input])
-            X = hstack([X_tfidf, X_numerical_scaled])
-            
-            raw_proba = model.predict_proba(X)[:, 1][0]
-            final_proba = adjust_prediction(all_features_for_report, raw_proba, homograph_features)
-            
-            # Store results and reset state
-            st.session_state.results = {
-                'final_proba': final_proba,
-                'raw_proba': raw_proba,
-                'lexical_features': lexical_features,
-                'advanced_features': advanced_features,
-                'homograph_features': homograph_features,
-                'source': source,
-                'all_features_for_report': all_features_for_report
-            }
-            st.session_state.analyzing = False
-            st.session_state.analysis_stage = "input"
+                placeholder_text = "🔍 Analyzing URL with AI Threat Intelligence..."
+        else:
+            placeholder_text = "Put link here"
+        
+        url_input = st.text_input(
+            "URL Input",
+            value=st.session_state.url_input_value,
+            placeholder=placeholder_text,
+            key="url_input",
+            label_visibility="collapsed",
+            disabled=st.session_state.analyzing,
+            on_change=None
+        )
+        # Update session state with the current input
+        st.session_state.url_input_value = url_input
+
+        submit_button = st.form_submit_button("🚀 ANALYZE", use_container_width=True)
+
+        if submit_button:
+            if not url_input:
+                st.warning("⚠️ Please enter a URL to analyze.")
+                st.markdown('</div>', unsafe_allow_html=True)
+                st.stop()
+            else:
+                st.session_state.analyzing = True
+                # Clear previous results
+                if 'results' in st.session_state:
+                    del st.session_state.results
+                
+                # Stage 1: Lexical Analysis
+                st.session_state.analysis_stage = "lexical"
+                logger.debug("Starting lexical analysis...")
+                hostname = extract_hostname(url_input)
+                lexical_features = extract_lexical(url_input)
+                homograph_features = detect_homograph_attack(hostname, url_input)
+                
+                # Stage 2: Live Data Fetching
+                st.session_state.analysis_stage = "live_data"
+                logger.debug("Starting live data fetching...")
+                if enriched_data_cache is not None and hostname in enriched_data_cache.index:
+                    cached_data = enriched_data_cache.loc[hostname].to_dict()
+                    advanced_features = {**cached_data, 'vt_malicious_votes': 0, 'gsb_threat_type': 'THREAT_TYPE_UNSPECIFIED', 'tranco_rank': get_tranco_rank(hostname).get('tranco_rank')}
+                    source = "Pre-computed Knowledge Base"
+                else:
+                    advanced_features = get_live_advanced_features(url_input, hostname)
+                    source = "Live Network Lookup"
+                
+                # Stage 3: Processing
+                st.session_state.analysis_stage = "processing"
+                logger.debug("Processing features for prediction...")
+                all_features_for_report = {**lexical_features, **advanced_features, 'hostname': hostname}
+                
+                model_input_df = pd.DataFrame(0, index=[0], columns=feature_cols)
+                for col, value in all_features_for_report.items():
+                    if col in model_input_df.columns: 
+                        model_input_df.at[0, col] = value
+                issuer_col = f"issuer_{advanced_features.get('cert_issuer', 'None')}"
+                if issuer_col in model_input_df.columns: 
+                    model_input_df.at[0, issuer_col] = 1
+                
+                X_numerical_scaled = scaler.transform(model_input_df[feature_cols])
+                X_tfidf = tfidf.transform([url_input])
+                X = hstack([X_tfidf, X_numerical_scaled])
+                
+                raw_proba = model.predict_proba(X)[:, 1][0]
+                final_proba = adjust_prediction(all_features_for_report, raw_proba, homograph_features)
+                
+                # Store results and reset state
+                st.session_state.results = {
+                    'final_proba': final_proba,
+                    'raw_proba': raw_proba,
+                    'lexical_features': lexical_features,
+                    'advanced_features': advanced_features,
+                    'homograph_features': homograph_features,
+                    'source': source,
+                    'all_features_for_report': all_features_for_report
+                }
+                st.session_state.analyzing = False
+                st.session_state.analysis_stage = "input"
+                st.session_state.url_input_value = url_input  # Retain the URL after analysis
     st.markdown('</div>', unsafe_allow_html=True)
 
 # Display Results
@@ -917,9 +953,9 @@ if 'results' in st.session_state:
     st.subheader("📊 Security Analysis Report", anchor=False)
     
     # Verdict
-    verdict_class = "verdict-high" if final_proba > 0.75 else "verdict-suspicious" if final_proba >= 0.3 else "verdict-safe"
-    verdict_icon = "🚨" if final_proba > 0.75 else "⚠️" if final_proba >= 0.3 else "✅"
-    verdict_text = "HIGH PHISHING RISK" if final_proba > 0.75 else "SUSPICIOUS – PROCEED WITH CAUTION" if final_proba >= 0.3 else "SAFE – NO MAJOR THREATS DETECTED"
+    verdict_class = "verdict-high" if final_proba > 0.75 else "verdict-suspicious" if final_proba >= 0.25 else "verdict-safe"
+    verdict_icon = "🚨" if final_proba > 0.75 else "⚠️" if final_proba >= 0.25 else "✅"
+    verdict_text = "HIGH PHISHING RISK" if final_proba > 0.75 else "SUSPICIOUS – PROCEED WITH CAUTION" if final_proba >= 0.25 else "SAFE – NO MAJOR THREATS DETECTED"
     st.markdown(f'<div class="verdict-text {verdict_class}">{verdict_icon} {verdict_text}</div>', unsafe_allow_html=True)
     
     # Gauge (Centered)
@@ -955,3 +991,12 @@ if 'results' in st.session_state:
         st.markdown("**🎭 Homograph Detection:**")
         st.json(results['homograph_features'])
     
+    st.markdown('</div>', unsafe_allow_html=True)
+
+# --- FOOTER ---
+st.markdown("""
+<div class="footer">
+    <p>🛡️ SafeSurfX leverages advanced machine learning, VirusTotal, Google Safe Browsing, and homograph detection to protect you from phishing threats.</p>
+    <p><a href="#">Privacy Policy</a> | <a href="#">Terms of Service</a></p>
+</div>
+""", unsafe_allow_html=True)
